@@ -7,6 +7,8 @@ from ase.io import read, write
 from ase.visualize import view
 from ase.build import make_supercell, molecule
 from ase.units import _amu
+from ase.io.lammpsdata import write_lammps_data
+from collections import Counter
 
 # --- Configuration Parameters ---
 MOF_FILENAME = 'C:/Users/Cameron/Documents/MOF files/UiO-66-NH2.cif'
@@ -102,9 +104,13 @@ print(f"Final System built. Total Atoms: {len(system)}. Final Box: {system.get_c
 unique_elements = sorted(set(system.get_chemical_symbols()))
 element_map = {el: i + 1 for i, el in enumerate(unique_elements)}
 system.set_tags([element_map[symbol] for symbol in system.get_chemical_symbols()])
+
 print("\n--- LAMMPS Setup ---")
 print(f"Atom Type Mapping (Element: Type ID): {element_map}")
-write('battery_system.data', system, format='lammps-data')
+print("Atom type counts:", Counter(system.get_tags()))
+assert np.all(np.isfinite(system.get_positions())), "Non-finite atom positions detected!"
+
+write_lammps_data('battery_system.data', system, atom_style='atomic')
 print("LAMMPS data file 'battery_system.data' written successfully.")
 
 # --- 5. Metrics ---
