@@ -68,17 +68,30 @@ mof = make_supercell(mof_primitive, SUPERCELL_MATRIX)
 mof_cell_len = mof.get_cell().lengths()
 print(f"MOF Supercell built. Atoms: {len(mof)}. Cell: {mof_cell_len} Å")
 
+# --- Cavity-Aware Placement ---
+print("--- Cavity-Aware Placement ---")
+pore_centers = get_pore_centers(mof, num_points=1000)
+
 min_coords = np.array([0, 0, 0])
 max_coords = mof_cell_len
 
 # --- 2. Build Shell/Gas Components ---
 print("--- 2. Building Shell/Gas Components ---")
-polymer_shell = sum([make_peo_segment().translate(np.random.uniform(min_coords, max_coords)) or make_peo_segment() for _ in range(PEO_SEGMENTS)], Atoms())
-ionic_liquid = sum([make_il_mol().translate(np.random.uniform(min_coords, max_coords)) or make_il_mol() for _ in range(IL_MOLECULES)], Atoms())
+peo_positions = pore_centers[np.random.choice(len(pore_centers), PEO_SEGMENTS, replace=False)]
 
-# --- Cavity-Aware Placement ---
-print("--- Cavity-Aware Placement ---")
-pore_centers = get_pore_centers(mof, num_points=1000)
+polymer_shell = Atoms()
+for pos in peo_positions:
+    peo = make_peo_segment()
+    peo.translate(pos - peo.get_center_of_mass())
+    polymer_shell += peo
+
+il_positions = pore_centers[np.random.choice(len(pore_centers), IL_MOLECULES, replace=False)]
+
+ionic_liquid = Atoms()
+for pos in il_positions:
+    il = make_il_mol()
+    il.translate(pos - il.get_center_of_mass())
+    ionic_liquid += il
 
 # Na⁺ Ions near pore centers
 na_positions = pore_centers[np.random.choice(len(pore_centers), NA_IONS, replace=False)]
@@ -109,6 +122,11 @@ print("\n--- LAMMPS Setup ---")
 print(f"Atom Type Mapping (Element: Type ID): {element_map}")
 print("Atom type counts:", Counter(system.get_tags()))
 assert np.all(np.isfinite(system.get_positions())), "Non-finite atom positions detected!"
+
+from scipy.spatial.distance import pdist
+min_dist = np.min(pdist(system.get_positions()))
+print(f"\nMinimum interatomic distance: {min_dist:.3f} Å")
+assert min_dist > 1.5, "Overlapping atoms detected. Aborting export..."
 
 write_lammps_data('battery_system.data', system, atom_style='atomic')
 print("LAMMPS data file 'battery_system.data' written successfully.")
