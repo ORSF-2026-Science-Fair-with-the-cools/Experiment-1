@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.spatial import cKDTree
-from scipy.spatial.distance import pdist
+from scipy.spatial.distance import pdist, squareform
 from ase import Atoms
 from ase.io import read, write
 from ase.visualize import view
@@ -22,7 +22,6 @@ PLACEMENT_RADIUS = 2.0
 MIN_SAFE_DISTANCE = 0.8  # Critical threshold for steric clash removal
 
 # --- Helper Functions (PEO, IL, Pore Centers) ---
-
 def make_peo_segment():
     symbols = ['C', 'C', 'O', 'H', 'H', 'H', 'H', 'H', 'H']
     positions = [
@@ -31,7 +30,12 @@ def make_peo_segment():
         [1.5, 0.9, 0.0], [1.5, -0.9, 0.0],
         [3.5, 0.5, 0.0], [3.5, -0.5, 0.0]
     ]
-    return Atoms(symbols=symbols, positions=positions)
+    peo = Atoms(symbols=symbols, positions=positions)
+    axis_vector = np.random.normal(size=3)
+    axis_vector /= np.linalg.norm(axis_vector)
+    angle = np.random.uniform(0, 360)
+    peo.rotate(angle, v=axis_vector, center=peo.get_center_of_mass())
+    return peo
 
 def make_il_mol():
     symbols = ['C']*6 + ['N']*2 + ['H']*11
@@ -46,7 +50,15 @@ def make_il_mol():
         [0.000, 2.000, 0.800], [0.000, 2.000, -0.800],
         [0.000, -2.000, 0.000]
     ]
-    return Atoms(symbols=symbols, positions=positions)
+    il = Atoms(symbols=symbols, positions=positions)
+
+    # Apply random rotation around a random 3D axis
+    axis_vector = np.random.normal(size=3)
+    axis_vector /= np.linalg.norm(axis_vector)
+    angle = np.random.uniform(0, 360)
+    il.rotate(angle, v=axis_vector, center=il.get_center_of_mass())
+
+    return il
 
 def get_pore_centers(mof, num_points=2000, min_distance=3.0):
     """Return candidate pore centers by sampling points far from MOF atoms."""
@@ -63,6 +75,19 @@ def get_pore_centers(mof, num_points=2000, min_distance=3.0):
         if len(pore_centers) >= num_points:
             break
     return np.array(pore_centers)
+
+def remove_clashes(system, min_dist=0.8):
+    positions = system.get_positions()
+    D = squareform(pdist(positions))
+    np.fill_diagonal(D, np.inf)
+    clashes = np.where(D < min_dist)
+    to_remove = set(clashes[0]) | set(clashes[1])
+    if to_remove:
+        print(f"Removing {len(to_remove)} atoms due to residual clashes.")
+        mask = np.ones(len(system), dtype=bool)
+        mask[list(to_remove)] = False
+        system = system[mask]
+    return system
 
 # --- 1. MOF Preparation ---
 print("--- 1. MOF Preparation ---")
@@ -141,7 +166,6 @@ if initial_min_dist < MIN_SAFE_DISTANCE:
     print(f"**Steric Clash Warning**: Initial distance {initial_min_dist:.3f} Å is below safety threshold. Starting removal process.")
     
     # --- Iterative Removal of Clashing Atoms ---
-    
     # Define indices of the MOF (these are fixed and should not be removed)
     mof_indices_in_system = set(range(len(mof)))
     
@@ -160,7 +184,6 @@ if initial_min_dist < MIN_SAFE_DISTANCE:
             continue
             
         # 2. Check Mobile atoms (PEO, IL, Na+, CO2):
-        
         # Check against MOF (Fast check using the MOF tree)
         mof_dist, _ = mof_tree.query(pos)
         if mof_dist < MIN_SAFE_DISTANCE:
@@ -188,13 +211,33 @@ if initial_min_dist < MIN_SAFE_DISTANCE:
     removed_count = len(system) - len(atoms_to_keep)
     system = system[atoms_to_keep]
     print(f"**Clash Removal Complete**: Removed {removed_count} mobile atoms (PEO/IL/Na+/CO2) to enforce minimum distance > {MIN_SAFE_DISTANCE} Å.")
-    
-# Re-calculate the minimum distance after filtering to confirm success
-final_min_dist = np.min(pdist(system.get_positions()))
-print(f"Final minimum interatomic distance: {final_min_dist:.3f} Å (Target: > {MIN_SAFE_DISTANCE} Å)")
 
-if final_min_dist < MIN_SAFE_DISTANCE:
-    raise AssertionError(f"FATAL: Steric clash filter failed. Final minimum distance is {final_min_dist:.3f} Å.")
+# Re-calculate the minimum distance after filtering to confirm success
+D = squareform(pdist(system.get_positions()))
+np.fill_diagonal(D, np.inf)  # ignore self-distances
+min_dist = np.min(D)
+i, j = np.unravel_index(np.argmin(D), D.shape)
+print(f"Final minimum interatomic distance: {min_dist:.3f} Å (Target: > 0.8 Å)")
+print(f"Closest atoms: {i} and {j}, distance = {D[i, j]:.3f} Å")
+
+# Iteratively clean the system
+while True:
+    D = squareform(pdist(system.get_positions()))
+    np.fill_diagonal(D, np.inf)
+    min_dist = np.min(D)
+    if min_dist > 0.8:
+        break
+    i, j = np.unravel_index(np.argmin(D), D.shape)
+    print(f"Clash detected: atoms {i} and {j}, distance = {D[i, j]:.3f} Å")
+    system = remove_clashes(system, min_dist=0.8)
+
+# Recalculate after final cleanup
+D = squareform(pdist(system.get_positions()))
+np.fill_diagonal(D, np.inf)
+min_dist = np.min(D)
+i, j = np.unravel_index(np.argmin(D), D.shape)
+print(f"Final minimum interatomic distance: {min_dist:.3f} Å (Target: > 0.8 Å)")
+print(f"Closest atoms: {i} and {j}, distance = {D[i, j]:.3f} Å")
 
 # Assign Atom Types for LAMMPS (re-assign tags as atom indices have changed)
 unique_elements = sorted(set(system.get_chemical_symbols()))
@@ -209,7 +252,6 @@ write_lammps_data('battery_system.data', system, atom_style='atomic')
 print("LAMMPS data file 'battery_system.data' written successfully.")
 
 # --- 5. Metrics (Updated Component Offsets) ---
-
 # Re-establish component indices/offsets AFTER filtering, as some atoms were removed
 mof_len = len(mof) # The MOF is the first component, its length is fixed
 polymer_shell_len = len(polymer_shell) - Counter(polymer_shell.get_chemical_symbols()).get('X', 0) # Placeholder to recalculate length
@@ -220,7 +262,6 @@ co2_gas_len = len(co2_gas)
 # Since we lost track of which specific component an atom belonged to after filtering,
 # we rely on the total count of each element to estimate the remaining mobile molecules.
 # A simpler and safer way for the metrics section is to use the atom tags/elements:
-
 total_mass = sum(system.get_masses())
 total_volume = system.get_volume()
 density_g_per_cm3 = (total_mass * Ang**3) / (total_volume * 1e-24) / 1000
@@ -265,10 +306,6 @@ if min_distances_to_mof:
 else:
     print("No Na+ ions or MOF atoms found for proximity check.")
 
-# --- CO2 Proximity ---
-print("\n--- CO2 Molecule Proximity Check (Less reliable after filtering) ---")
-# The CO2 proximity check is now less reliable as C/O atoms from PEO/IL cannot be distinguished from CO2
-
 # --- Visualization ---
 print("\n--- Visualization ---")
 # (Visualization code remains correct as it uses element symbols/atom indices)
@@ -295,4 +332,4 @@ ax.legend(markerscale=5)
 plt.savefig('system_distribution_colorcoded.png')
 print("Color-coded atom distribution plot saved as 'system_distribution_colorcoded.png'.")
 
-#view(system)
+view(system)
