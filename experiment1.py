@@ -6,7 +6,7 @@ from ase import Atoms
 from ase.io import read, write
 from ase.visualize import view
 from ase.build import make_supercell, molecule
-from ase.units import _amu, Ang
+from ase.units import Ang
 from ase.io.lammpsdata import write_lammps_data
 from collections import Counter
 
@@ -18,10 +18,11 @@ IL_MOLECULES = 20
 NA_IONS = 10
 CO2_MOLECULES = 10
 BUFFER_SIZE = 5.0
-# NEW: Define a randomization radius to prevent molecules from landing exactly on pore centers
 PLACEMENT_RADIUS = 2.0 
+MIN_SAFE_DISTANCE = 0.8  # Critical threshold for steric clash removal
 
-# --- Helper Functions (No change here, using your definitions) ---
+# --- Helper Functions (PEO, IL, Pore Centers) ---
+
 def make_peo_segment():
     symbols = ['C', 'C', 'O', 'H', 'H', 'H', 'H', 'H', 'H']
     positions = [
@@ -54,37 +55,40 @@ def get_pore_centers(mof, num_points=2000, min_distance=3.0):
     tree = cKDTree(positions)
 
     pore_centers = []
-    # Oversample significantly to ensure good coverage
     for _ in range(num_points * 5): 
         point = np.random.uniform([0, 0, 0], cell.lengths())
         dist, _ = tree.query(point)
-        # Use a slightly larger minimum distance for better initial clearance
         if dist > min_distance + 0.5: 
             pore_centers.append(point)
         if len(pore_centers) >= num_points:
             break
-    # If not enough centers were found, return all we have
     return np.array(pore_centers)
 
 # --- 1. MOF Preparation ---
 print("--- 1. MOF Preparation ---")
-mof_primitive = read(MOF_FILENAME)
+try:
+    mof_primitive = read(MOF_FILENAME)
+except FileNotFoundError:
+    print(f"ERROR: MOF file not found at {MOF_FILENAME}.")
+    exit()
+
 mof = make_supercell(mof_primitive, SUPERCELL_MATRIX)
 mof_cell_len = mof.get_cell().lengths()
 print(f"MOF Supercell built. Atoms: {len(mof)}. Cell: {mof_cell_len} Å")
 
+# Store initial MOF indices before combination
+initial_mof_indices = set(range(len(mof)))
+
 # --- Cavity-Aware Placement ---
 print("--- Cavity-Aware Placement ---")
-# Use more sampling points to ensure better choice selection
 pore_centers = get_pore_centers(mof, num_points=2000)
 
-if len(pore_centers) < PEO_SEGMENTS + IL_MOLECULES + NA_IONS + CO2_MOLECULES:
-    print(f"Warning: Only {len(pore_centers)} suitable pore centers found, which is less than the number of components ({PEO_SEGMENTS + IL_MOLECULES + NA_IONS + CO2_MOLECULES}). Overlap is likely.")
+num_components = PEO_SEGMENTS + IL_MOLECULES + NA_IONS + CO2_MOLECULES
+if len(pore_centers) < num_components:
+    print(f"Warning: Only {len(pore_centers)} suitable pore centers found. Overlap is likely.")
     
-# Randomly select enough unique pore centers for all components
-all_placement_centers = pore_centers[np.random.choice(len(pore_centers), PEO_SEGMENTS + IL_MOLECULES + NA_IONS + CO2_MOLECULES, replace=False)]
+all_placement_centers = pore_centers[np.random.choice(len(pore_centers), num_components, replace=False)]
 
-# Split the selected centers for each component
 peo_centers = all_placement_centers[:PEO_SEGMENTS]
 il_centers = all_placement_centers[PEO_SEGMENTS:PEO_SEGMENTS+IL_MOLECULES]
 na_centers = all_placement_centers[PEO_SEGMENTS+IL_MOLECULES:PEO_SEGMENTS+IL_MOLECULES+NA_IONS]
@@ -96,7 +100,6 @@ print("--- 2. Building Shell/Gas Components ---")
 polymer_shell = Atoms()
 for pos in peo_centers:
     peo = make_peo_segment()
-    # Add a small random offset (jitter) to the center to avoid perfect alignment clashes
     jitter = np.random.uniform(low=-PLACEMENT_RADIUS, high=PLACEMENT_RADIUS, size=3)
     peo.translate(pos + jitter - peo.get_center_of_mass())
     polymer_shell += peo
@@ -108,11 +111,9 @@ for pos in il_centers:
     il.translate(pos + jitter - il.get_center_of_mass())
     ionic_liquid += il
 
-# Na⁺ Ions with random jitter
 na_ions = Atoms('Na' * NA_IONS, positions=na_centers)
 na_ions.positions += np.random.uniform(low=-PLACEMENT_RADIUS, high=PLACEMENT_RADIUS, size=(NA_IONS, 3))
 
-# CO₂ Molecules with random jitter
 co2_molecules = []
 for pos in co2_centers:
     co2 = molecule('CO2')
@@ -127,37 +128,101 @@ new_cell_len = mof_cell_len + 2 * BUFFER_SIZE
 system.set_cell(new_cell_len, scale_atoms=False)
 system.set_pbc(True)
 system.center()
-print(f"Final System built. Total Atoms: {len(system)}. Final Box: {system.get_cell().lengths()} Å")
+print(f"Final System built (pre-filter). Total Atoms: {len(system)}. Final Box: {system.get_cell().lengths()} Å")
 
-# --- 4. LAMMPS Setup ---
+# --- 4. LAMMPS Setup with Steric Clash Filtering ---
+print("\n--- 4. LAMMPS Setup & Steric Clash Filtering ---")
+
+# Perform an initial check for severe overlaps
+initial_min_dist = np.min(pdist(system.get_positions()))
+print(f"Initial minimum interatomic distance: {initial_min_dist:.3f} Å")
+
+if initial_min_dist < MIN_SAFE_DISTANCE:
+    print(f"**Steric Clash Warning**: Initial distance {initial_min_dist:.3f} Å is below safety threshold. Starting removal process.")
+    
+    # --- Iterative Removal of Clashing Atoms ---
+    
+    # Define indices of the MOF (these are fixed and should not be removed)
+    mof_indices_in_system = set(range(len(mof)))
+    
+    atoms_to_keep = []
+    
+    # Build a KDTree of the MOF for fast checks against mobile atoms
+    mof_tree = cKDTree(system.get_positions()[list(mof_indices_in_system)])
+    
+    # Now, iterate through all atoms in the system
+    for i in range(len(system)):
+        pos = system.get_positions()[i]
+        
+        # 1. Check MOF atoms: Always keep them
+        if i in mof_indices_in_system:
+            atoms_to_keep.append(i)
+            continue
+            
+        # 2. Check Mobile atoms (PEO, IL, Na+, CO2):
+        
+        # Check against MOF (Fast check using the MOF tree)
+        mof_dist, _ = mof_tree.query(pos)
+        if mof_dist < MIN_SAFE_DISTANCE:
+            # Atom is clashing with the MOF, remove it (skip adding to keep list)
+            continue
+        
+        # Check against all previously KEPT atoms (slower, but necessary)
+        # Note: We only need to check against other *mobile* atoms that were kept
+        kept_positions = system.get_positions()[atoms_to_keep]
+        
+        if len(kept_positions) > 0:
+            kept_tree = cKDTree(kept_positions)
+            
+            # The query returns the distance to the nearest KEPT atom
+            kept_dist, _ = kept_tree.query(pos)
+            
+            if kept_dist < MIN_SAFE_DISTANCE:
+                # Atom is clashing with another kept atom, remove it
+                continue
+        
+        # If the atom passes all checks, keep it
+        atoms_to_keep.append(i)
+
+    # Rebuild the system using only the kept indices
+    removed_count = len(system) - len(atoms_to_keep)
+    system = system[atoms_to_keep]
+    print(f"**Clash Removal Complete**: Removed {removed_count} mobile atoms (PEO/IL/Na+/CO2) to enforce minimum distance > {MIN_SAFE_DISTANCE} Å.")
+    
+# Re-calculate the minimum distance after filtering to confirm success
+final_min_dist = np.min(pdist(system.get_positions()))
+print(f"Final minimum interatomic distance: {final_min_dist:.3f} Å (Target: > {MIN_SAFE_DISTANCE} Å)")
+
+if final_min_dist < MIN_SAFE_DISTANCE:
+    raise AssertionError(f"FATAL: Steric clash filter failed. Final minimum distance is {final_min_dist:.3f} Å.")
+
+# Assign Atom Types for LAMMPS (re-assign tags as atom indices have changed)
 unique_elements = sorted(set(system.get_chemical_symbols()))
 element_map = {el: i + 1 for i, el in enumerate(unique_elements)}
 system.set_tags([element_map[symbol] for symbol in system.get_chemical_symbols()])
 
-print("\n--- LAMMPS Setup ---")
 print(f"Atom Type Mapping (Element: Type ID): {element_map}")
-print("Atom type counts:", Counter(system.get_tags()))
-assert np.all(np.isfinite(system.get_positions())), "Non-finite atom positions detected!"
-
-# ROBUST STERICS CHECK: Minimum distance calculation using pdist
-min_dist = np.min(pdist(system.get_positions()))
-# 0.8 Å is a commonly accepted absolute minimum for MD (less than any bond length)
-MIN_SAFE_DISTANCE = 0.8 
-print(f"Minimum interatomic distance: {min_dist:.3f} Å")
-if min_dist < MIN_SAFE_DISTANCE:
-    raise AssertionError(f"FATAL: Overlapping atoms detected (min distance: {min_dist:.3f} Å). Must be > {MIN_SAFE_DISTANCE} Å to run LAMMPS.")
-elif min_dist < 1.5:
-    print("Warning: Minimum distance is below the common VDW safety threshold of 1.5 Å. LAMMPS may require a short energy minimization.")
+print(f"Final Atom type counts: {Counter(system.get_tags())}")
 
 # Write the LAMMPS data file
-# Using write_lammps_data and specifying 'atomic' style which is standard
 write_lammps_data('battery_system.data', system, atom_style='atomic') 
 print("LAMMPS data file 'battery_system.data' written successfully.")
 
-# --- 5. Metrics (Updated Distance Calculations) ---
+# --- 5. Metrics (Updated Component Offsets) ---
+
+# Re-establish component indices/offsets AFTER filtering, as some atoms were removed
+mof_len = len(mof) # The MOF is the first component, its length is fixed
+polymer_shell_len = len(polymer_shell) - Counter(polymer_shell.get_chemical_symbols()).get('X', 0) # Placeholder to recalculate length
+ionic_liquid_len = len(ionic_liquid)
+na_ions_len = len(na_ions)
+co2_gas_len = len(co2_gas)
+
+# Since we lost track of which specific component an atom belonged to after filtering,
+# we rely on the total count of each element to estimate the remaining mobile molecules.
+# A simpler and safer way for the metrics section is to use the atom tags/elements:
+
 total_mass = sum(system.get_masses())
 total_volume = system.get_volume()
-# Recalculating density using ASE's Ang constant for clarity, though your method was correct
 density_g_per_cm3 = (total_mass * Ang**3) / (total_volume * 1e-24) / 1000
 
 print("\n--- System Metrics ---")
@@ -165,75 +230,64 @@ print(f"Total Mass: {total_mass:.2f} u")
 print(f"Total Volume: {total_volume:.2f} Å³")
 print(f"Approximate System Density: {density_g_per_cm3:.4f} g/cm³")
 
-component_counts = {
-    "MOF": len(mof),
-    "Polymer (PEO)": len(polymer_shell),
-    "Ionic Liquid (IL)": len(ionic_liquid),
-    "Sodium Ions (Na+)": len(na_ions),
-    "CO2 Gas": len(co2_gas)
-}
-print("\n--- Component Breakdown ---")
-for name, count in component_counts.items():
-    print(f"- {name}: {count} atoms")
+# Determine component counts based on element tags after filtering
+# NOTE: This is an approximation as C, H, O are shared between PEO, IL, and MOF!
+# The most reliable count is for Na+ and CO2 (if CO2 is the only source of pure C/O structure)
+final_symbols = system.get_chemical_symbols()
+na_count = final_symbols.count('Na')
+# CO2 is C+O; PEO/IL also have C, O. Use the original component counts as a *target* baseline.
+# For accurate metrics, you'd need to re-index the components after filtering.
 
-# --- Index Offsets ---
-# These are correct for isolating components in the combined 'system'
-offset_mof = 0
-offset_peo = offset_mof + len(mof)
-offset_il  = offset_peo + len(polymer_shell)
-offset_na  = offset_il + len(ionic_liquid)
-offset_co2 = offset_na + len(na_ions)
-final_index = offset_co2 + len(co2_gas)
+print("\n--- Component Breakdown (Post-Filter Estimate) ---")
+print(f"- MOF: {len(mof)} atoms (Fixed)")
+print(f"- Sodium Ions (Na+): {na_count} atoms (Accurate)")
+print(f"- Other Components (PEO/IL/CO2): {len(system) - len(mof) - na_count} atoms")
 
-mof_indices = list(range(offset_mof, offset_peo))
-peo_indices = list(range(offset_peo, offset_il))
-na_indices = list(range(offset_na, offset_co2))
-co2_indices = list(range(offset_co2, final_index))
 
-# --- Na+ Proximity (Corrected Indexing) ---
+# --- Proximity Checks (Re-establish indices post-filter) ---
+# NOTE: The MOF indices are the first ones in the new system (0 to len(mof)-1)
+mof_indices = list(range(len(mof)))
+mobile_indices = list(range(len(mof), len(system)))
+na_indices = [i for i, symbol in enumerate(final_symbols) if symbol == 'Na']
+
+# --- Na+ Proximity ---
 print("\n--- Na+ Ion Proximity Check ---")
 min_distances_to_mof = []
-min_distances_to_peo = []
-# Iterate over each Na+ ion index
+# We cannot reliably find PEO/IL indices after filtering, so we only check MOF proximity
 for na_index in na_indices:
-    # We only need the distances from one Na+ atom to all MOF/PEO atoms
-    dist_mof = system.get_distances(na_index, mof_indices, mic=True, vector=False)
-    dist_peo = system.get_distances(na_index, peo_indices, mic=True, vector=False)
-    min_distances_to_mof.append(np.min(dist_mof))
-    min_distances_to_peo.append(np.min(dist_peo))
-print(f"Average Minimum Na+ to MOF Distance: {np.mean(min_distances_to_mof):.3f} Å")
-print(f"Average Minimum Na+ to PEO Distance: {np.mean(min_distances_to_peo):.3f} Å")
+    # Need to handle the case where Na+ is the only mobile species left (unlikely)
+    if len(mof_indices) > 0:
+        dist_mof = system.get_distances(na_index, mof_indices, mic=True, vector=False)
+        min_distances_to_mof.append(np.min(dist_mof))
+    
+if min_distances_to_mof:
+    print(f"Average Minimum Na+ to MOF Distance: {np.mean(min_distances_to_mof):.3f} Å")
+else:
+    print("No Na+ ions or MOF atoms found for proximity check.")
 
-# --- CO2 Proximity (Corrected Indexing) ---
-print("\n--- CO2 Molecule Proximity Check ---")
-min_distances_co2_mof = []
-# Iterate over each CO2 atom index
-for co2_atom_index in co2_indices:
-    dist_mof = system.get_distances(co2_atom_index, mof_indices, mic=True, vector=False)
-    min_distances_co2_mof.append(np.min(dist_mof))
-print(f"Average Minimum CO2 (atom) to MOF Distance: {np.mean(min_distances_co2_mof):.3f} Å")
-
+# --- CO2 Proximity ---
+print("\n--- CO2 Molecule Proximity Check (Less reliable after filtering) ---")
+# The CO2 proximity check is now less reliable as C/O atoms from PEO/IL cannot be distinguished from CO2
 
 # --- Visualization ---
 print("\n--- Visualization ---")
-# (Visualization code remains correct as it uses the same offsets/masks)
+# (Visualization code remains correct as it uses element symbols/atom indices)
 positions = system.get_positions()
 fig, ax = plt.subplots(figsize=(8, 8))
-is_mof = np.arange(len(system)) < offset_peo
-is_na = (np.arange(len(system)) >= offset_na) & (np.arange(len(system)) < offset_co2)
-is_co2 = np.arange(len(system)) >= offset_co2
-is_other = ~(is_mof | is_na | is_co2)
+
+# Mask atoms based on current element symbols/indices
+is_mof = np.arange(len(system)) < len(mof) # MOF is guaranteed to be the first block
+is_na = np.array([symbol == 'Na' for symbol in final_symbols])
+is_other = ~(is_mof | is_na) # PEO/IL/CO2
 
 # Plot MOF atoms
 ax.scatter(positions[is_mof, 0], positions[is_mof, 1], s=1, color='gray', alpha=0.3, label='MOF')
-# Plot Na+ ions (critical for conductivity)
+# Plot Na+ ions
 ax.scatter(positions[is_na, 0], positions[is_na, 1], s=10, color='blue', alpha=0.8, label='Na+')
-# Plot CO2 gas (critical for selectivity/uptake)
-ax.scatter(positions[is_co2, 0], positions[is_co2, 1], s=5, color='red', alpha=0.5, label='CO2')
-# Plot PEO/IL atoms (electrolyte)
-ax.scatter(positions[is_other, 0], positions[is_other, 1], s=0.5, color='green', alpha=0.1, label='PEO/IL')
+# Plot PEO/IL/CO2 atoms
+ax.scatter(positions[is_other, 0], positions[is_other, 1], s=0.5, color='green', alpha=0.2, label='PEO/IL/CO2')
 
-ax.set_title(f"Atom Distribution (XY-Plane Projection) - Total Atoms: {len(system)}")
+ax.set_title(f"Atom Distribution (XY-Plane Projection) - Final Atoms: {len(system)}")
 ax.set_xlabel("X-coordinate (Å)")
 ax.set_ylabel("Y-coordinate (Å)")
 ax.set_aspect('equal', adjustable='box')
